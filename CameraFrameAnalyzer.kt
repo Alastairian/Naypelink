@@ -67,4 +67,106 @@ class CameraFrameAnalyzer(private val listener: (FrameData) -> Unit) : ImageAnal
         // IMPORTANT: Must close the ImageProxy when done to release the buffer
         imageProxy.close()
     }
+    package com.synapselink.app
+
+import android.graphics.ImageFormat
+import android.media.Image
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import android.util.Log
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.Face
+
+// This class represents Logos's initial 'Deeper Learning' for visual input,
+// now enhanced with face detection and landmark extraction.
+class CameraFrameAnalyzer(private val listener: (FrameData) -> Unit) : ImageAnalysis.Analyzer {
+
+    // Configure ML Kit Face Detector for real-time performance and landmark detection.
+    // This is a 'calculated action' by Logos to optimize for relevant features.
+    private val options = FaceDetectorOptions.Builder()
+        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST) // Prioritize speed
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)       // Crucial for bio-signals
+        .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)         // More detailed facial geometry
+        .setMinFaceSize(0.15f) // Minimum face size to detect (e.g., 15% of image size)
+        .enableTracking() // Enable face tracking across frames (useful for consistency)
+        .build()
+
+    private val faceDetector = FaceDetection.getClient(options)
+
+    // Define a data class to encapsulate processed frame data, now including face information
+    data class FrameData(
+        val timestamp: Long,
+        val width: Int,
+        val height: Int,
+        val format: Int,
+        val rotationDegrees: Int,
+        val faces: List<Face> // List of detected faces with landmarks, contours, etc.
+    )
+
+    override fun analyze(imageProxy: ImageProxy) {
+        val currentTime = System.currentTimeMillis() // Capture analysis timestamp
+
+        // Ensure the ImageProxy contains a valid image
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            Log.w("SynapseLinkCamera", "ImageProxy did not contain a valid media Image. Skipping frame.")
+            imageProxy.close()
+            // Pathos might generate a "missing data" intuitive marker here.
+            return
+        }
+
+        // Prepare the image for ML Kit. This is Logos preparing the input for its
+        // specialized analytical module.
+        val inputImage = InputImage.fromMediaImage(
+            mediaImage,
+            imageProxy.imageInfo.rotationDegrees
+        )
+
+        // Process the image for face detection.
+        // This is where Logos performs its 'calculated action' of extracting features.
+        faceDetector.process(inputImage)
+            .addOnSuccessListener { faces ->
+                // Logos has successfully extracted face data. Now pass it to the next stage.
+                listener(
+                    FrameData(
+                        timestamp = currentTime,
+                        width = imageProxy.width,
+                        height = imageProxy.height,
+                        format = imageProxy.format,
+                        rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                        faces = faces // The list of detected faces
+                    )
+                )
+                if (faces.isNotEmpty()) {
+                    Log.d("SynapseLinkCamera", "Detected ${faces.size} face(s). First face bounds: ${faces[0].boundingBox}")
+                } else {
+                    Log.d("SynapseLinkCamera", "No faces detected in frame.")
+                    // Pathos might generate a "no face detected" contextual cue here,
+                    // potentially adjusting confidence in bio-signal readings.
+                }
+            }
+            .addOnFailureListener { e ->
+                // Logos encountered an analytical failure.
+                Log.e("SynapseLinkCamera", "Face detection failed: ${e.message}", e)
+                // Pathos might generate a "visual analysis failure" intuitive marker,
+                // potentially triggering a fallback or warning state.
+                listener( // Still pass data, but with empty face list to indicate failure
+                    FrameData(
+                        timestamp = currentTime,
+                        width = imageProxy.width,
+                        height = imageProxy.height,
+                        format = imageProxy.format,
+                        rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                        faces = emptyList()
+                    )
+                )
+            }
+            .addOnCompleteListener {
+                // IMPORTANT: Must close the ImageProxy when done to release the buffer
+                // regardless of success or failure. This ensures efficient resource management.
+                imageProxy.close()
+            }
+    }
 }
