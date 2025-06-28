@@ -878,5 +878,305 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 }
+package com.synapselink.app
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.synapselink.app.databinding.ActivityMainBinding
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
+import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var viewBinding: ActivityMainBinding
+    private lateinit var cameraExecutor: ExecutorService
+    private var imageCapture: ImageCapture? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var audioRecord: AudioRecord? = null
+    private var isAudioRecording = false
+    private var audioRecordingJob: Job? = null
+
+    // IAI-IPS Component Instances
+    private lateinit var cameraFrameAnalyzer: CameraFrameAnalyzer
+    private lateinit var audioBufferAnalyzer: AudioBufferAnalyzer
+    private lateinit var synapseLinkProcessor: SynapseLinkProcessor
+
+    companion object {
+        private const val TAG = "SynapseLinkApp"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS =
+            mutableListOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO
+            ).toTypedArray()
+
+        const val AUDIO_SAMPLE_RATE = 44100
+        const val AUDIO_CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
+        const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        private const val AUDIO_BUFFER_SIZE_FACTOR = 2
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        viewBinding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(viewBinding.root)
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        cameraFrameAnalyzer = CameraFrameAnalyzer { frameData ->
+            synapseLinkProcessor.onNewFrameData(frameData)
+        }
+
+        audioBufferAnalyzer = AudioBufferAnalyzer { audioData ->
+            synapseLinkProcessor.onNewAudioData(audioData)
+        }
+
+        synapseLinkProcessor = SynapseLinkProcessor { bioSignalData ->
+            // This is where BioSignalData is received. It's then passed for higher-level inference within processor.
+        }
+
+        // Set the listener for inferred cognitive states from Logos (with Pathos marker)
+        synapseLinkProcessor.setOnInferredStateReadyListener { inferredState ->
+            Log.i(TAG, "IAI-IPS Inferred State: " +
+                    "Engagement: ${inferredState.engagementLevel}, " +
+                    "Arousal: ${inferredState.arousalLevel}, " +
+                    "Confidence: ${String.format("%.2f", inferredState.combinedConfidence)}, " +
+                    "Pathos Marker: '${inferredState.pathosIntuitiveMarker}'") // Display Pathos's marker
+
+            updateStatus("L: ${inferredState.engagementLevel}, ${inferredState.arousalLevel}\nP: '${inferredState.pathosIntuitiveMarker}'")
+        }
+
+        // Collect Pathos's alertness level and update UI (Demonstrates Logos receiving Pathos's guidance)
+        lifecycleScope.launchWhenStarted {
+            synapseLinkProcessor.getPathosCore().currentAlertnessLevel.collectLatest { alertness ->
+                viewBinding.pathosAlertnessTextView.text = "Pathos Alertness: ${String.format("%.2f", alertness)}"
+            }
+        }
+        // Collect Pathos's intuitive marker and update UI
+        lifecycleScope.launchWhenStarted {
+            synapseLinkProcessor.getPathosCore().intuitiveMarker.collectLatest { marker ->
+                viewBinding.pathosMarkerTextView.text = "Pathos Marker: '${marker}'"
+            }
+        }
+
+
+        // Request camera and audio permissions
+        if (allPermissionsGranted()) {
+            startSynapseLinkSensors()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+
+        viewBinding.toggleProcessingButton.setOnClickListener {
+            if (isAudioRecording) {
+                stopProcessing()
+            } else {
+                startProcessing()
+            }
+        }
+
+        // --- Simulate External Crisis Alert Button ---
+        viewBinding.crisisButton.setOnClickListener {
+            synapseLinkProcessor.getPathosCore().triggerCrisisAlert() // Pathos reacts to external stimulus
+            Toast.makeText(this, "Crisis Alert Triggered by Pathos!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                startSynapseLinkSensors()
+            } else {
+                Toast.makeText(this, "Permissions not granted by the user.", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }
+    }
+
+    private fun startSynapseLinkSensors() {
+        startCamera()
+        updateStatus("Camera and Microphone Initialized. Ready for Processing.")
+    }
+
+    private fun startProcessing() {
+        viewBinding.toggleProcessingButton.text = "Stop Processing"
+        startAudioRecording()
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            try {
+                cameraProvider.bindToLifecycle(
+                    this, CameraSelector.DEFAULT_FRONT_CAMERA, imageAnalysis
+                )
+                Log.d(TAG, "Image analysis use case bound for processing.")
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to bind image analysis use case.", exc)
+            }
+        }, ContextCompat.getMainExecutor(this))
+
+        synapseLinkProcessor.startProcessing()
+        updateStatus("Processing biological signals...")
+    }
+
+    private fun stopProcessing() {
+        viewBinding.toggleProcessingButton.text = "Start Processing"
+        stopAudioRecording()
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            try {
+                cameraProvider.unbind(imageAnalysis)
+                Log.d(TAG, "Image analysis use case unbound. Processing stopped.")
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to unbind image analysis use case.", exc)
+            }
+        }, ContextCompat.getMainExecutor(this))
+
+        synapseLinkProcessor.stopProcessing()
+        updateStatus("Processing stopped. Ready to restart.")
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
+            }
+
+            imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST_FROM_PIPELINE)
+                .setTargetResolution(android.util.Size(1280, 720))
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, cameraFrameAnalyzer)
+                }
+
+            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview
+                )
+                Log.d(TAG, "Camera initialized successfully with preview.")
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+                updateStatus("Camera initialization failed: ${exc.message}")
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun startAudioRecording() {
+        val bufferSize = AudioRecord.getMinBufferSize(
+            AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_CONFIG, AUDIO_FORMAT
+        ) * AUDIO_BUFFER_SIZE_FACTOR
+
+        if (bufferSize == AudioRecord.ERROR_BAD_VALUE || bufferSize == AudioRecord.ERROR) {
+            Log.e(TAG, "AudioRecord: Invalid buffer size or error occurred.")
+            updateStatus("Audio recording setup failed: Invalid buffer size.")
+            return
+        }
+
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord: Initialization failed.")
+                updateStatus("Audio recording initialization failed.")
+                audioRecord?.release()
+                audioRecord = null
+                return
+            }
+
+            audioRecord?.startRecording()
+            isAudioRecording = true
+            Log.d(TAG, "Audio recording started with buffer size: $bufferSize bytes")
+            updateStatus("Audio recording active...")
+
+            audioRecordingJob = CoroutineScope(Dispatchers.IO).launch {
+                val audioBuffer = ShortArray(bufferSize / 2)
+                while (isActive && isAudioRecording) {
+                    val shortsRead = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
+                    if (shortsRead > 0) {
+                        audioBufferAnalyzer.analyze(audioBuffer, shortsRead)
+                    }
+                }
+                Log.d(TAG, "Audio recording job finished.")
+            }
+
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Audio recording permission not granted.", e)
+            updateStatus("Audio recording failed: Permission denied.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting audio recording", e)
+            updateStatus("Audio recording failed: ${e.message}")
+        }
+    }
+
+    private fun stopAudioRecording() {
+        isAudioRecording = false
+        audioRecordingJob?.cancel()
+        audioRecord?.apply {
+            if (state == AudioRecord.STATE_INITIALIZED) {
+                stop()
+            }
+            release()
+        }
+        audioRecord = null
+        Log.d(TAG, "Audio recording stopped.")
+        updateStatus("Audio recording stopped.")
+    }
+
+    private fun updateStatus(message: String) {
+        runOnUiThread {
+            viewBinding.statusTextView.text = message
+            // viewBinding.pathosMarkerTextView.text = message // This should be updated separately
+            Log.i(TAG, message)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        stopAudioRecording()
+        synapseLinkProcessor.stopProcessing()
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            cameraProvider.unbindAll()
+        }, ContextCompat.getMainExecutor(this))
+    }
+}
+
 
 
