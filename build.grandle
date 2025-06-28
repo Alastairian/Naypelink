@@ -68,3 +68,26 @@ dependencies {
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
 }
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.synapselink.app'
+    compileSdk 34
+    // ... (rest of your android block)
+    buildFeatures {
+        viewBinding true
+    }
+}
+
+dependencies {
+    // ... (existing dependencies)
+
+    // ML Kit Face Detection
+    implementation 'com.google.mlkit:face-detection:16.1.5'
+
+    // (Optional, if you want to use the bundled model for offline use)
+    // implementation 'com.google.mlkit:face-detection-bundled:16.1.5'
+}
