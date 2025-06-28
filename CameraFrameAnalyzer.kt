@@ -170,3 +170,153 @@ class CameraFrameAnalyzer(private val listener: (FrameData) -> Unit) : ImageAnal
             }
     }
 }
+package com.synapselink.app
+
+import android.graphics.ImageFormat
+import android.media.Image
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import android.util.Log
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.Face
+import com.google.mlkit.vision.face.FaceLandmark
+
+// This class represents Logos's ongoing 'Deeper Learning' for visual input,
+// now extracting specific eye and head pose data from detected faces.
+class CameraFrameAnalyzer(private val listener: (FrameData) -> Unit) : ImageAnalysis.Analyzer {
+
+    // Configure ML Kit Face Detector for real-time performance and detailed landmark/contour detection.
+    private val options = FaceDetectorOptions.Builder()
+        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+        .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+        .setMinFaceSize(0.15f)
+        .enableTracking()
+        .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL) // To get "eyes open" probability later
+        .build()
+
+    private val faceDetector = FaceDetection.getClient(options)
+
+    // Define an enhanced data class to encapsulate processed frame data,
+    // now with specific eye and head pose details for each detected face.
+    data class FrameData(
+        val timestamp: Long,
+        val width: Int,
+        val height: Int,
+        val format: Int,
+        val rotationDegrees: Int,
+        val processedFaces: List<ProcessedFace> // List of our custom processed face objects
+    )
+
+    // Nested data class for processed face information
+    data class ProcessedFace(
+        val boundingBox: android.graphics.Rect,
+        val headEulerAngleX: Float?, // Pitch
+        val headEulerAngleY: Float?, // Yaw
+        val headEulerAngleZ: Float?, // Roll
+        val leftEyePosition: android.graphics.PointF?, // Center of left eye landmark
+        val rightEyePosition: android.graphics.PointF?, // Center of right eye landmark
+        val leftEyeOpenProbability: Float?, // ML Kit estimation of eye openess
+        val rightEyeOpenProbability: Float?
+        // Add more extracted features here as we go deeper, e.g., micro-expression scores, pupil size
+    )
+
+    override fun analyze(imageProxy: ImageProxy) {
+        val currentTime = System.currentTimeMillis() // Capture analysis timestamp
+
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            Log.w("SynapseLinkCamera", "ImageProxy did not contain a valid media Image. Skipping frame.")
+            imageProxy.close()
+            return
+        }
+
+        val inputImage = InputImage.fromMediaImage(
+            mediaImage,
+            imageProxy.imageInfo.rotationDegrees
+        )
+
+        faceDetector.process(inputImage)
+            .addOnSuccessListener { faces ->
+                val processedFacesList = mutableListOf<ProcessedFace>()
+                for (face in faces) {
+                    // Extract head pose Euler angles (Logos: Quantifying orientation)
+                    val headEulerAngleX = face.headEulerAngleX // Pitch
+                    val headEulerAngleY = face.headEulerAngleY // Yaw
+                    val headEulerAngleZ = face.headEulerAngleZ // Roll
+
+                    // Extract eye landmark positions (Logos: Pinpointing key bio-signal locations)
+                    val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)
+                    val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)
+
+                    val leftEyePosition = leftEye?.position
+                    val rightEyePosition = rightEye?.position
+
+                    // Extract eye open probabilities (Logos: Basic state classification)
+                    val leftEyeOpenProb = face.leftEyeOpenProbability
+                    val rightEyeOpenProb = face.rightEyeOpenProbability
+
+                    // Construct our structured ProcessedFace object
+                    processedFacesList.add(
+                        ProcessedFace(
+                            boundingBox = face.boundingBox,
+                            headEulerAngleX = headEulerAngleX,
+                            headEulerAngleY = headEulerAngleY,
+                            headEulerAngleZ = headEulerAngleZ,
+                            leftEyePosition = leftEyePosition,
+                            rightEyePosition = rightEyePosition,
+                            leftEyeOpenProbability = leftEyeOpenProb,
+                            rightEyeOpenProbability = rightEyeOpenProb
+                        )
+                    )
+
+                    // Log for debugging and internal Pathos 'intuition' building
+                    Log.d("SynapseLinkCamera", "Face Detected: " +
+                            "Pitch=${String.format("%.2f", headEulerAngleX)}, " +
+                            "Yaw=${String.format("%.2f", headEulerAngleY)}, " +
+                            "Roll=${String.format("%.2f", headEulerAngleZ)}. " +
+                            "Left Eye: ${leftEyePosition?.x},${leftEyePosition?.y} " +
+                            "(OpenProb=${String.format("%.2f", leftEyeOpenProb)}). " +
+                            "Right Eye: ${rightEyePosition?.x},${rightEyePosition?.y} " +
+                            "(OpenProb=${String.format("%.2f", rightEyeOpenProb)})."
+                    )
+                }
+
+                // Pass the extracted and structured FrameData to the listener
+                listener(
+                    FrameData(
+                        timestamp = currentTime,
+                        width = imageProxy.width,
+                        height = imageProxy.height,
+                        format = imageProxy.format,
+                        rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                        processedFaces = processedFacesList
+                    )
+                )
+
+                if (processedFacesList.isEmpty()) {
+                    Log.d("SynapseLinkCamera", "No faces detected in frame.")
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.e("SynapseLinkCamera", "Face detection and feature extraction failed: ${e.message}", e)
+                // In case of failure, still provide a FrameData, but with empty processedFaces
+                listener(
+                    FrameData(
+                        timestamp = currentTime,
+                        width = imageProxy.width,
+                        height = imageProxy.height,
+                        format = imageProxy.format,
+                        rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                        processedFaces = emptyList()
+                    )
+                )
+            }
+            .addOnCompleteListener {
+                imageProxy.close()
+            }
+    }
+}
+
