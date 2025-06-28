@@ -336,4 +336,215 @@ class SynapseLinkProcessor(private val onBioSignalDataReady: (BioSignalData) -> 
         )
     }
 }
+package com.synapseLink.app
+
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+
+// This class represents the central processing unit where Logos integrates
+// and synchronizes multi-modal biological signals, infers higher-level states,
+// and now actively interacts with Pathos.
+class SynapseLinkProcessor(private val onBioSignalDataReady: (BioSignalData) -> Unit) {
+
+    // Buffers to store recent visual and audio data.
+    private val visualDataBuffer = ConcurrentLinkedQueue<CameraFrameAnalyzer.FrameData>()
+    private val audioDataBuffer = ConcurrentLinkedQueue<AudioBufferAnalyzer.AudioData>()
+
+    private val MAX_BUFFER_SIZE = 5
+    private val SYNC_TOLERANCE_MS = 100L
+
+    private var syncJob: Job? = null
+    private val syncScope = CoroutineScope(Dispatchers.Default)
+
+    private var onInferredStateReady: ((CognitiveState) -> Unit)? = null
+
+    // Instantiate PathosCore - the other half of the Twine Cognition system
+    private val pathosCore = PathosCore()
+
+    // Add a public getter for PathosCore if MainActivity needs to interact with it directly
+    fun getPathosCore(): PathosCore = pathosCore
+
+    // New data class to represent an inferred cognitive state by Logos
+    data class CognitiveState(
+        val timestamp: Long,
+        val engagementLevel: String, // E.g., "Engaged", "Neutral", "Disengaged"
+        val arousalLevel: String,    // E.g., "Calm", "Moderate", "High"
+        val combinedConfidence: Float, // Logos's confidence in this inference
+        val pathosIntuitiveMarker: String // Pathos's latest intuitive marker for this state
+    )
+
+    fun setOnInferredStateReadyListener(listener: (CognitiveState) -> Unit) {
+        this.onInferredStateReady = listener
+    }
+
+    companion object {
+        private const val TAG = "SynapseLinkProcessor"
+    }
+
+    fun startProcessing() {
+        if (syncJob?.isActive == true) {
+            Log.d(TAG, "SynapseLinkProcessor already running.")
+            return
+        }
+        syncJob = syncScope.launch {
+            while (true) {
+                attemptSynchronization()
+                delay(SYNC_TOLERANCE_MS / 2)
+            }
+        }
+        Log.d(TAG, "SynapseLinkProcessor started.")
+    }
+
+    fun stopProcessing() {
+        syncJob?.cancel()
+        syncJob = null
+        visualDataBuffer.clear()
+        audioDataBuffer.clear()
+        Log.d(TAG, "SynapseLinkProcessor stopped. Buffers cleared.")
+    }
+
+
+    fun onNewFrameData(frameData: CameraFrameAnalyzer.FrameData) {
+        if (visualDataBuffer.size >= MAX_BUFFER_SIZE) {
+            visualDataBuffer.poll()
+        }
+        visualDataBuffer.offer(frameData)
+        Log.v(TAG, "Received frame data. Buffer size: ${visualDataBuffer.size}")
+    }
+
+    fun onNewAudioData(audioData: AudioBufferAnalyzer.AudioData) {
+        if (audioDataBuffer.size >= MAX_BUFFER_SIZE) {
+            audioDataBuffer.poll()
+        }
+        audioDataBuffer.offer(audioData)
+        Log.v(TAG, "Received audio data. Buffer size: ${audioDataBuffer.size}")
+    }
+
+    private fun attemptSynchronization() {
+        val currentVisual = visualDataBuffer.peek()
+        val currentAudio = audioDataBuffer.peek()
+
+        if (currentVisual == null || currentAudio == null) {
+            return
+        }
+
+        val timeDiff = abs(currentVisual.timestamp - currentAudio.timestamp)
+
+        if (timeDiff <= SYNC_TOLERANCE_MS) {
+            val combinedData = BioSignalData(
+                timestamp = (currentVisual.timestamp + currentAudio.timestamp) / 2,
+                visualSignals = visualDataBuffer.poll(),
+                audioSignals = audioDataBuffer.poll()
+            )
+            Log.d(TAG, "Synchronized data at ${combinedData.timestamp}. Visual-Audio diff: $timeDiff ms")
+
+            onBioSignalDataReady(combinedData)
+
+            // --- Logos's Higher-Level Interpretation (Simulator Function) ---
+            val inferredState = inferCognitiveState(combinedData)
+
+            // --- Logos sends its state to Pathos for intuitive assessment ---
+            pathosCore.processLogosState(inferredState) // Pass the inferred state to Pathos
+            val finalInferredState = inferredState.copy(pathosIntuitiveMarker = pathosCore.intuitiveMarker.value)
+
+            onInferredStateReady?.invoke(finalInferredState)
+
+        } else if (currentVisual.timestamp < currentAudio.timestamp - SYNC_TOLERANCE_MS) {
+            Log.v(TAG, "Visual data too old (${timeDiff}ms diff), discarding: ${visualDataBuffer.poll()?.timestamp}")
+        } else if (currentAudio.timestamp < currentVisual.timestamp - SYNC_TOLERANCE_MS) {
+            Log.v(TAG, "Audio data too old (${timeDiff}ms diff), discarding: ${audioDataBuffer.poll()?.timestamp}")
+        }
+    }
+
+    // --- Logos: Inferring Cognitive State (Simplified Example with Pathos Influence) ---
+    private fun inferCognitiveState(bioSignalData: BioSignalData): CognitiveState {
+        var engagement = "Neutral"
+        var arousal = "Calm"
+        var confidence = 0.5f
+
+        val visualSignals = bioSignalData.visualSignals
+        val audioSignals = bioSignalData.audioSignals
+
+        // Logos queries Pathos for its current suggested alertness level.
+        // This is Pathos influencing Logos's weighting and prioritization.
+        val pathosAlertness = pathosCore.getSuggestedAlertness()
+        Log.v(TAG, "Logos leveraging Pathos Alertness: ${String.format("%.2f", pathosAlertness)}")
+
+        // Adjust inference thresholds or confidence based on Pathos's suggestion
+        // This demonstrates Pathos's 'organizing cognition' guiding Logos.
+        val engagementThreshold = 0.7f + (pathosAlertness * 0.1f) // Higher alertness -> slightly higher engagement threshold
+        val arousalThreshold = 0.05 + (pathosAlertness * 0.02) // Higher alertness -> slightly more sensitive to arousal
+
+
+        // Visual cues for Engagement/Arousal
+        visualSignals?.processedFaces?.firstOrNull()?.let { face ->
+            val pitch = face.headEulerAngleX ?: 0f
+            val yaw = face.headEulerAngleY ?: 0f
+            val roll = face.headEulerAngleZ ?: 0f
+            val leftEyeOpen = face.leftEyeOpenProbability ?: 0f
+            val rightEyeOpen = face.rightEyeOpenProbability ?: 0f
+
+            if (abs(pitch) < 15 && abs(yaw) < 15 && abs(roll) < 15) {
+                if (pathosAlertness > 0.7f) engagement = "Highly Engaged" else engagement = "Engaged"
+                confidence += 0.1f
+            } else {
+                engagement = "Disengaged"
+                confidence -= 0.1f
+            }
+
+            if (leftEyeOpen > engagementThreshold && rightEyeOpen > engagementThreshold) {
+                if (engagement == "Engaged" || engagement == "Highly Engaged") {
+                    engagement = "Deeply Engaged" // Deeper if eyes open and Pathos suggests high focus
+                    confidence += 0.15f
+                }
+                arousal = "Moderate"
+                confidence += 0.05f
+            } else if (leftEyeOpen < 0.3f || rightEyeOpen < 0.3f) {
+                engagement = "Disengaged"
+                arousal = "Calm"
+                confidence -= 0.1f
+            }
+        }
+
+        // Auditory cues for Arousal/Engagement
+        audioSignals?.let { audio ->
+            if (audio.rms > arousalThreshold) {
+                arousal = "Moderate"
+                if (engagement.contains("Engaged", true) || pathosAlertness > 0.6f) {
+                    arousal = "High" // Combined visual/pathos input for higher arousal
+                }
+                confidence += 0.1f
+            } else if (audio.rms < 0.01) {
+                arousal = "Calm"
+                if (engagement.contains("Engaged", true) && pathosAlertness > 0.7f) {
+                    engagement = "Deeply Engaged (Quiet)" // Focused in silence
+                }
+                confidence += 0.05f
+            }
+
+            if (audio.zeroCrossingRate > 0.2) {
+                if (arousal == "Calm" && pathosAlertness < 0.3f) arousal = "Moderate" // Slight arousal from sound complexity
+                confidence += 0.05f
+            }
+        }
+
+        confidence = confidence.coerceIn(0f, 1f)
+
+        return CognitiveState(
+            timestamp = bioSignalData.timestamp,
+            engagementLevel = engagement,
+            arousalLevel = arousal,
+            combinedConfidence = confidence,
+            pathosIntuitiveMarker = "No Marker Yet" // Will be updated by PathosCore
+        )
+    }
+}
+
 
